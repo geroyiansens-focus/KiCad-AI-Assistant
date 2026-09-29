@@ -16,6 +16,7 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
+from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
 
@@ -75,6 +76,7 @@ def _make_client(
     settings = types.SimpleNamespace(
         llm_provider="openai",
         llm_api_key="sk-test",
+        llm_user_agent=DEFAULT_LLM_USER_AGENT,
         llm_model="gpt-4o",
         llm_base_url="",
         llm_context_tokens=context_tokens,
@@ -1566,13 +1568,17 @@ class TestOpenAICompatibleRequests:
         assert client._openai_headers() == {
             "Content-Type": "application/json",
             "Authorization": "Bearer sk-test",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_authorization(self):
         client = _make_client()
         client._settings.llm_api_key = ""
 
-        assert client._openai_headers() == {"Content-Type": "application/json"}
+        assert client._openai_headers() == {
+            "Content-Type": "application/json",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
+        }
 
     def test_api_key_adds_x_api_key(self):
         client = _make_client()
@@ -1581,6 +1587,7 @@ class TestOpenAICompatibleRequests:
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
             "x-api-key": "sk-test",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_x_api_key(self):
@@ -1590,7 +1597,67 @@ class TestOpenAICompatibleRequests:
         assert client._anthropic_headers() == {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
+
+    def test_default_user_agent_is_proven_python_requests(self):
+        """The default UA must be a proven value, not a plugin-branded one."""
+        client = _make_client()
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "python-requests/2.32.3"
+            assert not headers["User-Agent"].startswith("KiCad-AI-Assistant")
+
+    def test_default_user_agent_with_empty_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "python-requests/2.32.3"
+            assert not headers["User-Agent"].startswith("KiCad-AI-Assistant")
+
+    def test_user_agent_never_starts_with_python_urllib(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert not headers["User-Agent"].startswith("Python-urllib")
+
+    def test_both_builders_send_identical_user_agent(self):
+        client = _make_client()
+
+        openai_ua = client._openai_headers()["User-Agent"]
+        anthropic_ua = client._anthropic_headers()["User-Agent"]
+        assert openai_ua == anthropic_ua
+        assert anthropic_ua == DEFAULT_LLM_USER_AGENT
+
+    def test_custom_user_agent_used_by_openai_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        assert client._openai_headers()["User-Agent"] == "axios/1.7.0"
+
+    def test_custom_user_agent_used_by_anthropic_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        assert client._anthropic_headers()["User-Agent"] == "axios/1.7.0"
+
+    def test_custom_user_agent_not_confused_with_urllib_default(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "axios/1.7.0"
+            assert "Python-urllib" not in headers["User-Agent"]
+
+    def test_empty_user_agent_falls_back_to_plugin_constant(self):
+        """Empty setting (legacy in-memory objects) keeps the plugin constant
+        as a safety fallback; the proven default covers real configs."""
+        client = _make_client()
+        client._settings.llm_user_agent = ""
+
+        assert client._user_agent() == llm_client._LLM_USER_AGENT
 
 
 # ---------------------------------------------------------------------------

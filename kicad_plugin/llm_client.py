@@ -252,6 +252,16 @@ _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 # alone nearly fills the history budget (issue #140).
 _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 
+# Fallback User-Agent for OpenAI/Anthropic requests, used only when the
+# llm_user_agent setting is empty (e.g. a legacy in-memory settings object).
+# urllib's default "Python-urllib/x.y" is rejected with HTTP 403 by some
+# OpenAI/Anthropic-compatible gateways (OpenRouter, Groq, vLLM, LM Studio,
+# corporate proxies). The user-facing default is the proven
+# "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
+# type of agent" — review on #150). Version literal must stay in sync with
+# pyproject.toml (the plugin package has no __version__).
+_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.5 (+https://github.com/paul356/KiCad-AI-Assistant)"
+
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
 # ------------------------------------------------------------------
@@ -3213,11 +3223,19 @@ class LLMClient:
             url, headers, encoded, timeout=300, fmt="anthropic", on_stream_event=on_stream_event
         )
 
+    def _user_agent(self) -> str:
+        """User-Agent for OpenAI/Anthropic requests: the llm_user_agent
+        setting value (defaults to the proven python-requests UA, issue
+        #149). The plugin constant is only a safety net for empty settings
+        (legacy in-memory objects)."""
+        return getattr(self._settings, "llm_user_agent", "") or _LLM_USER_AGENT
+
     def _anthropic_headers(self) -> dict[str, str]:
         """Build headers for Anthropic-compatible endpoints with optional auth."""
         headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            "User-Agent": self._user_agent(),
         }
         if self._settings.llm_api_key:
             headers["x-api-key"] = self._settings.llm_api_key
@@ -3234,7 +3252,7 @@ class LLMClient:
 
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "User-Agent": self._user_agent()}
         if self._settings.llm_api_key:
             headers["Authorization"] = f"Bearer {self._settings.llm_api_key}"
         return headers
