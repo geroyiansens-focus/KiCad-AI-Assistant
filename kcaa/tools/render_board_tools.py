@@ -3,8 +3,12 @@ Self-contained PCB board renderer (no kicad-cli dependency).
 
 Renders a composite image of a KiCad board with the KiCad default theme
 (dark background): courtyards, copper layers, board edge, silkscreen text,
-and — when requested — the green ratsnest of user-specified pads that are
-not yet routed.
+pad labels (``ref.number``, default on for VLM-facing renders, with
+collision avoidance in dense areas), and — when requested — the green
+ratsnest of user-specified pads that are not yet routed.
+
+Renders can be restricted to a board-coordinate ``region`` (mm) and can
+report machine-usable pad coordinates alongside the image.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ matplotlib.use("Agg")
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
 import matplotlib.patches as mpatches  # noqa: E402
+import matplotlib.patheffects as mpatheffects  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -63,6 +68,27 @@ _Z_VIA = 5
 _Z_EDGE = 6
 _Z_SILK = 7
 _Z_RATSNEST = 8
+_Z_PAD_LABEL = 9
+
+# Pad labels (ref.number) drawn next to each pad, default on.
+_PAD_LABEL_MM = 0.4  # glyph height, mm
+_PAD_LABEL_OFFSET_MM = 0.6  # distance from the pad center, mm
+# Dark text with a white stroke stays readable over any fill (dark
+# background, copper, silkscreen).
+_PAD_LABEL_COLOR = "#0F0F12"
+_PAD_LABEL_STROKE = "#FFFFFF"
+# Collision tolerance: a fresh label whose bbox (grown by this fraction of
+# the glyph height per side) touches an already-placed label is skipped.
+_LABEL_GAP_FRACTION = 0.15
+
+# Footprint-level reference labels (e.g. "U11"), drawn once per footprint
+# only when its silkscreen reference text is not already visible in this
+# render.  Bigger than pad labels and silk-gray so they read as a
+# footprint, not a pad.
+_FP_REF_SCALE = 1.5  # glyph height multiplier vs pad labels
+_FP_REF_COLOR = _SILK_COLOR
+_FP_REF_STROKE = _PAD_LABEL_COLOR
+_FP_REF_ALPHA = 0.9
 
 _PT_PER_MM = 72.0 / 25.4
 
@@ -128,19 +154,59 @@ def _arc_points(start: tuple, mid: tuple, end: tuple, n: int = 32) -> list[tuple
     ]
 
 
+_CLOSED_EDGE_KINDS = ("fp_rect", "gr_rect", "fp_circle", "gr_circle", "fp_poly", "gr_poly")
+
+
+def _closed_shape_polygon(entry: dict) -> list[tuple[float, float]] | None:
+    """Closed polygon of an Edge.Cuts shape (rect/circle/poly), or None."""
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return None
+        x0, y0 = s
+        x1, y1 = e
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    if kind in ("fp_circle", "gr_circle"):
+        c = entry.get("center")
+        e = entry.get("end")
+        if c is None or e is None:
+            return None
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r <= 0:
+            return None
+        return [
+            (c[0] + r * math.cos(2 * math.pi * i / 48), c[1] + r * math.sin(2 * math.pi * i / 48))
+            for i in range(49)
+        ]
+    if kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if len(pts) < 3:
+            return None
+        return list(pts) + [pts[0]]
+    return None
+
+
 def _board_outline(board) -> list[tuple[float, float]] | None:
-    """Closed outline of the board from Edge.Cuts, or None if not closed."""
+    """Closed outline of the board from Edge.Cuts, or None if not closed.
+
+    Closed shapes (rect/circle/poly) never belong to the outline segment
+    chain — they are cutouts, or the whole outline when the board edge is
+    a single shape (e.g. a gr_rect from set_board_outline_rect).
+    """
     segs: list[list[tuple[float, float]]] = []
+    closed: list[dict] = []
     for e in board.edges:
         kind = e.get("kind")
         if kind == "gr_line":
             segs.append([e["start"], e["end"]])
         elif kind == "gr_arc":
             segs.append(_arc_points(e["start"], e["mid"], e["end"]))
-        elif kind in ("gr_rect", "gr_circle", "gr_poly"):
-            # Not a simple segment chain; skip — outline clipping is best effort.
-            return None
+        elif kind in _CLOSED_EDGE_KINDS:
+            closed.append(e)
     if not segs:
+        if len(closed) == 1:
+            return _closed_shape_polygon(closed[0])
         return None
     pts = list(segs[0])
     remaining = segs[1:]
@@ -174,6 +240,96 @@ def _clip_patch(ax, outline: list[tuple[float, float]]):
     patch = mpatches.PathPatch(path, transform=ax.transData, facecolor="none", edgecolor="none")
     ax.add_patch(patch)
     return patch
+
+
+def _closed_shape_centroid(entry: dict) -> tuple[float, float] | None:
+    """Centroid of a closed Edge.Cuts shape — the point tested against the
+    board outline to decide whether the shape is an internal opening."""
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return None
+        return ((s[0] + e[0]) / 2, (s[1] + e[1]) / 2)
+    if kind in ("fp_circle", "gr_circle"):
+        return entry.get("center")
+    if kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if not pts:
+            return None
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    return None
+
+
+def _point_in_polygon(pt: tuple[float, float], poly: list[tuple[float, float]]) -> bool:
+    """Strict point-in-polygon by ray casting (outline in board mm).
+
+    A point on the outline itself is NOT inside: shapes that sit on the
+    board boundary (corner roundings, edge notches) are part of the outer
+    edge and must not be painted as holes.
+    """
+    x, y = pt
+    n = len(poly)
+    # Reject points essentially on the boundary (well below any rendered
+    # pixel size) before ray casting, which is ambiguous on the outline.
+    eps = 1e-6
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        denom = math.hypot(dx, dy)
+        if denom == 0:
+            continue
+        dist = abs(dx * (y1 - y) - dy * (x1 - x)) / denom
+        if dist < eps:
+            return False
+    inside = False
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+            inside = not inside
+    return inside
+
+
+def _edge_cutout_fill(ax: Any, entry: dict, outline: list[tuple[float, float]] | None) -> None:
+    """Paint an internal Edge.Cuts opening as a hole: background-colored
+    fill over whatever copper sits beneath, mirroring thru-hole drill
+    openings.  The yellow edge ring is drawn separately by the outline
+    pass, so the two never overlap.
+    """
+    if outline is None:
+        return
+    centroid = _closed_shape_centroid(entry)
+    if centroid is None or not _point_in_polygon(centroid, outline):
+        return
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return
+        patch = mpatches.Rectangle(
+            s, e[0] - s[0], e[1] - s[1], facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA
+        )
+    elif kind in ("fp_circle", "gr_circle"):
+        c = entry.get("center") or entry.get("start")
+        e = entry.get("end")
+        if c is None or e is None:
+            return
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r <= 0:
+            return
+        patch = mpatches.Circle(c, r, facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA)
+    elif kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if len(pts) < 3:
+            return
+        patch = mpatches.Polygon(
+            pts, closed=True, facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA
+        )
+    else:
+        return
+    ax.add_patch(patch)
 
 
 def _is_courtyard(layer: str) -> bool:
@@ -451,6 +607,7 @@ def _parse_text(
         pname = str(node[1])
         if pname not in ("Reference", "Value"):
             return None
+        text_kind = "reference" if pname == "Reference" else "value"
         label = str(node[2]) if len(node) > 2 else ""
         for sub in node:
             if isinstance(sub, list) and _sym(sub[0]) == "hide":
@@ -459,6 +616,7 @@ def _parse_text(
         kind = _sym(node[1])
         if kind not in ("reference", "value", "user"):
             return None
+        text_kind = kind
         label = str(node[2]) if len(node) > 2 else ""
         if label == "${REFERENCE}":
             label = ref
@@ -493,6 +651,7 @@ def _parse_text(
                             bold = True
     return {
         "kind": "text",
+        "text_kind": text_kind,
         "label": label,
         "at": _wpt(fp, at[0], at[1]),
         "rot": rot,
@@ -969,74 +1128,42 @@ def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int)
     )
 
 
-def render_board(
-    pcb_path: str,
-    connect_pads: list[str] | None = None,
-    dpi: int | None = None,
-    layer: str | None = None,
-) -> tuple[list[str], bytes, dict[str, Any]]:
-    """Render a board to (report_lines, png_bytes, report_dict).
+_MIN_RENDER_WIDTH_PX = 1600  # sharpness floor for any rendered width
+# Matplotlib's Agg renderer allocates path buffers that explode with the
+# dpi value itself; past ~40k dpi it raises MemoryError (std::bad_alloc)
+# on tiny figures.  When the 1600 px floor needs a higher dpi, the figure
+# grows in inches instead (same pixel output, safe dpi).
+_MAX_SAFE_DPI = 4000
 
-    ``layer``: optional copper layer name (e.g. ``"F.Cu"``) to render a
-    single-layer image.  Only that layer's zones/pads/tracks are drawn;
-    vias, board edge, courtyards and silkscreen stay as reference.
 
-    ``dpi`` scales the PNG resolution directly (line widths and font sizes
-    are in mm units, so a higher dpi gives a sharper image of the same
-    layout).  Defaults to 200.
+def _new_board_figure(
+    xmin: float, ymin: float, xmax: float, ymax: float, dpi: int
+) -> tuple[Any, Any, int, float]:
+    """Create a board figure/axes in KiCad convention (+Y down, dark bg).
 
-    connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
-    to draw ratsnest lines for — green, only for nets that are not yet routed.
+    ``xmin/ymin/xmax/ymax`` are the rendered bounding box in board mm;
+    pass a ``region`` box to zoom.  Returns ``(fig, ax, eff_dpi,
+    mm_per_px)``: ``eff_dpi`` is the dpi actually used for savefig and
+    ``mm_per_px`` the true scale of the rendered image (used to size
+    pixel-constant decorations like ratsnest dashes).  The rendered width
+    is >= ``_MIN_RENDER_WIDTH_PX`` at any board size, so a narrow region
+    zooms at full-board sharpness.
     """
-    if dpi is None:
-        dpi = 200
-    board = parse_board(pcb_path)
-
-    # Resolve requested pads to nets (name-based in KiCad 10).
-    requested: dict[str, list[tuple[tuple[float, float], tuple[str, ...]]]] = {}
-    missing: list[str] = []
-    for spec in connect_pads or []:
-        ref, _, num = spec.partition(".")
-        found = None
-        for p in board.pads:
-            if p.ref == ref and p.number == num:
-                found = p
-                break
-        if found is None:
-            missing.append(spec)
-            continue
-        if found.net:
-            requested.setdefault(found.net, []).append((found.center, tuple(found.copper_layers)))
-
-    # Each ratsnest edge carries the copper layers shared by its endpoint
-    # pads (a route could exist there), so a single-layer render can draw it
-    # on the layer where both pads live.
-    ratsnest: list[tuple[tuple[float, float], tuple[float, float], set[str]]] = []
-    pending_nets: list[str] = []
-    routed_reported: list[str] = []
-    for net, pts in sorted(requested.items()):
-        if len(pts) < 2:
-            continue
-        if net in board.routed_nets:
-            routed_reported.append(net)
-            continue
-        pending_nets.append(net)
-        centers = [p[0] for p in pts]
-        layers = [p[1] for p in pts]
-        for j, i in _mst(centers):
-            # Layers both endpoint pads share (a route could exist there);
-            # fall back to the union when the pads have no common layer.
-            shared = set(layers[j]) & set(layers[i])
-            ratsnest.append((centers[j], centers[i], shared or (set(layers[j]) | set(layers[i]))))
-
-    # --- figure ---
-    xmin, ymin, xmax, ymax = _bounds(board, ratsnest)
-    w_mm, h_mm = xmax - xmin, ymax - ymin
+    w_mm = xmax - xmin
+    h_mm = ymax - ymin
     fig_w_in = w_mm / 25.4
-    # Scale dpi so the output is sharp at any board size (min 1600px wide).
+    fig_h_in = h_mm / 25.4
+    # Scale dpi so the output is sharp at any board size (min 1600px wide);
+    # clamp the floor so the Agg renderer never sees an extreme dpi.
     if w_mm >= 0.1:
-        dpi = max(dpi, int(1600 / fig_w_in))
-    fig, ax = plt.subplots(figsize=(fig_w_in, h_mm / 25.4), dpi=dpi)
+        dpi = max(dpi, min(int(_MIN_RENDER_WIDTH_PX / fig_w_in), _MAX_SAFE_DPI))
+        if fig_w_in * dpi < _MIN_RENDER_WIDTH_PX:
+            # Cap bound: grow the figure inches (both axes by the same
+            # factor -> board aspect preserved) to hit the pixel target.
+            scale = _MIN_RENDER_WIDTH_PX / (fig_w_in * dpi)
+            fig_w_in *= scale
+            fig_h_in *= scale
+    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=dpi)
     ax.set_facecolor(_BG_COLOR)
     fig.patch.set_facecolor(_BG_COLOR)
     ax.set_xlim(xmin, xmax)
@@ -1044,6 +1171,148 @@ def render_board(
     ax.invert_yaxis()  # KiCad PCB convention: +Y down.
     ax.set_aspect("equal")
     ax.axis("off")
+    mm_per_px = w_mm / (fig_w_in * dpi)
+    return fig, ax, dpi, mm_per_px
+
+
+def _pad_label_text(p: Pad, label_format: str) -> str:
+    """Label text for a pad: ``"number"`` -> just the pad number, the #144
+    default ``"ref.number"`` -> ``REF.PAD``."""
+    if label_format == "number":
+        return p.number
+    if label_format == "ref.number":
+        return f"{p.ref}.{p.number}"
+    raise ValueError(f"label_format must be 'number' or 'ref.number', got {label_format!r}")
+
+
+def _draw_pad_label(
+    ax: Any,
+    p: Pad,
+    fontsize_mm: float = _PAD_LABEL_MM,
+    offset_mm: float = _PAD_LABEL_OFFSET_MM,
+    label_format: str = "number",
+) -> Any:
+    """Draw the pad label beside the pad center.
+
+    Tries right-up placement first, then left-down, right-down, left-up:
+    the first box that fits inside the rendered frame wins (a pad in a
+    frame corner never loses its label).  The y axis is inverted (KiCad
+    +Y down), so "up" is the direction of decreasing data y.  Returns the
+    Text artist so the caller can measure its box for collision avoidance.
+    """
+    cx, cy = p.center
+    label = _pad_label_text(p, label_format)
+    width_est = len(label) * 0.6 * fontsize_mm
+    height = fontsize_mm
+    x_left, x_right = ax.get_xlim()  # left, right frame edges in data mm
+    # Inverted axis: get_ylim() returns (ymax, ymin) — the bottom edge
+    # first, the top edge second.
+    y_bottom, y_top = ax.get_ylim()
+    # Placements, box spans in data mm, each guarded by its in-frame check
+    # ("right" = +x, "up" = -y, "down" = +y with the inverted axis):
+    #   right-up:   x [cx+off, cx+off+w],  y [cy-off-h, cy-off]
+    #   left-down:  x [cx-off-w, cx-off],  y [cy+off, cy+off+h]
+    #   right-down: x [cx+off, cx+off+w],  y [cy+off, cy+off+h]
+    #   left-up:    x [cx-off-w, cx-off],  y [cy-off-h, cy-off]
+    placements = (
+        (
+            offset_mm,
+            -offset_mm,
+            "left",
+            "bottom",
+            cx + offset_mm + width_est <= x_right and cy - offset_mm - height >= y_top,
+        ),
+        (
+            -offset_mm,
+            offset_mm,
+            "right",
+            "top",
+            cx - offset_mm - width_est >= x_left and cy + offset_mm + height <= y_bottom,
+        ),
+        (
+            offset_mm,
+            offset_mm,
+            "left",
+            "top",
+            cx + offset_mm + width_est <= x_right and cy + offset_mm + height <= y_bottom,
+        ),
+        (
+            -offset_mm,
+            -offset_mm,
+            "right",
+            "bottom",
+            cx - offset_mm - width_est >= x_left and cy - offset_mm - height >= y_top,
+        ),
+    )
+    # A label box can exceed the whole frame on a tiny region zoom; fall
+    # back to right-up rather than raise.
+    dx, dy, ha, va = next(
+        ((d, o, h, v) for d, o, h, v, fits in placements if fits),
+        (offset_mm, -offset_mm, "left", "bottom"),
+    )
+    return ax.text(
+        cx + dx,
+        cy + dy,
+        label,
+        ha=ha,
+        va=va,
+        fontsize=fontsize_mm * _PT_PER_MM,
+        color=_PAD_LABEL_COLOR,
+        zorder=_Z_PAD_LABEL,
+        path_effects=[mpatheffects.withStroke(linewidth=0.3, foreground=_PAD_LABEL_STROKE)],
+    )
+
+
+def _label_data_bbox(ax: Any, artist: Any, renderer: Any) -> tuple[float, float, float, float]:
+    """Bounding box of a text artist in data coordinates (x0, y0, x1, y1)."""
+    win = artist.get_window_extent(renderer)
+    inv = ax.transData.inverted()
+    p0 = inv.transform((win.x0, win.y0))
+    p1 = inv.transform((win.x1, win.y1))
+    return (
+        min(p0[0], p1[0]),
+        min(p0[1], p1[1]),
+        max(p0[0], p1[0]),
+        max(p0[1], p1[1]),
+    )
+
+
+def _bbox_overlaps(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    gap: float,
+) -> bool:
+    """True when axis-aligned boxes ``a`` and ``b`` touch within ``gap``."""
+    return a[0] - gap < b[2] and a[2] + gap > b[0] and a[1] - gap < b[3] and a[3] + gap > b[1]
+
+
+def _draw_board_layers(
+    ax: Any,
+    board: BoardData,
+    layer: str | None = None,
+    show_pad_labels: bool = False,
+    label_scale: float = 1.0,
+    label_format: str = "number",
+    show_footprint_refs: bool = True,
+) -> tuple[int, int, list[str], int, list[str]]:
+    """Draw the static board layers into ``ax`` — zones, courtyards, copper
+    pads and tracks, vias, board edge, silkscreen — with optional pad
+    labels and footprint reference labels on top.
+
+    Pad labels are collision-avoided: a label whose box overlaps an
+    already-placed one is skipped.  Footprint refs (one per footprint,
+    only when its silkscreen reference is not already rendered) share the
+    same placement boxes.  Returns ``(labels_drawn, label_collisions,
+    skipped_pad_refs, fp_refs_drawn, skipped_fp_refs)``.
+    """
+    fontsize_mm = _PAD_LABEL_MM * label_scale
+    offset_mm = _PAD_LABEL_OFFSET_MM * label_scale
+
+    pad_labels_drawn = 0
+    label_collisions = 0
+    label_skipped: list[str] = []
+    label_boxes: list[tuple[float, float, float, float]] = []
+    renderer: Any = None
 
     # 1. Filled copper zones (bottom of visual stack).
     # Plain semi-transparent layer color, clipped to the board outline so the
@@ -1105,6 +1374,24 @@ def render_board(
                     zorder=_Z_VIA,
                 )
             )
+        if show_pad_labels:
+            artist = _draw_pad_label(
+                ax, p, fontsize_mm=fontsize_mm, offset_mm=offset_mm, label_format=label_format
+            )
+            if renderer is None:
+                renderer = ax.figure.canvas.get_renderer()
+            box = _label_data_bbox(ax, artist, renderer)
+            gap = fontsize_mm * _LABEL_GAP_FRACTION
+            if any(_bbox_overlaps(box, placed, gap) for placed in label_boxes):
+                # Dense area: this label would smear into another one —
+                # skip it (it still counts as a pad in the report, and the
+                # collision is reported so callers know it went unlabeled).
+                artist.remove()
+                label_collisions += 1
+                label_skipped.append(f"{p.ref}.{p.number}")
+            else:
+                label_boxes.append(box)
+                pad_labels_drawn += 1
     for seg in board.tracks:
         slayer = seg["layer"]
         if layer is not None and slayer != layer:
@@ -1146,8 +1433,14 @@ def render_board(
                 )
             )
 
-    # 5. Board edge (Edge.Cuts).
+    # 5. Board edge (Edge.Cuts).  Internal closed openings (LED windows,
+    # sensor apertures, cutouts) render as holes: a background-colored
+    # fill under the yellow ring, like a thru-hole drill opening.  Shapes
+    # that sit on the board outline itself (corner roundings, edge
+    # notches) are part of the boundary and stay as pure outlines.
     for e in board.edges:
+        if e.get("kind") in _CLOSED_EDGE_KINDS:
+            _edge_cutout_fill(ax, e, outline)
         _draw_shape(ax, e, _layer_color("Edge.Cuts"), 1.0, 1.0, _Z_EDGE)
 
     # 6. Silkscreen text (top of the visual stack), only on its own side.
@@ -1168,13 +1461,247 @@ def render_board(
             zorder=_Z_SILK,
         )
 
+    # 7. Footprint reference labels — one per footprint whose silkscreen
+    # reference is NOT already drawn in this render (full-board views draw
+    # the reference silk itself; single-layer / region views may filter it
+    # out).  Anchored at the footprint's drawn-pad centroid, tried above /
+    # below / left / right until one fits next to the pad labels; bigger
+    # and silk-gray so it reads as the footprint, not a pad.  Shares the
+    # pad-label collision boxes.
+    if show_footprint_refs:
+        fp_refs_drawn = 0
+        fp_refs_skipped: list[str] = []
+        # Silkscreen reference labels that this render will actually show
+        # (same silk side and inside the rendered frame — a reference text
+        # outside a region zoom is filtered out, so its footprint gets a
+        # re-drawn label instead).
+        x_frame_left, x_frame_right = ax.get_xlim()
+        y_frame_bottom, y_frame_top = ax.get_ylim()  # inverted: (ymax, ymin)
+        silk_rendered_refs: set[str] = set()
+        for t in board.texts:
+            if t.get("text_kind") != "reference":
+                continue
+            if layer is not None and t["layer"].split(".")[0] != layer.split(".")[0]:
+                continue
+            tx, ty = t["at"]
+            if not (x_frame_left <= tx <= x_frame_right and y_frame_top <= ty <= y_frame_bottom):
+                continue
+            silk_rendered_refs.add(t["label"])
+        # Footprint anchor: centroid of the pads actually drawn above (a
+        # footprint shows only when at least one of its pads is rendered).
+        fp_pts: dict[str, list[tuple[float, float]]] = {}
+        for p in board.pads:
+            if p.shape is None:
+                continue
+            if layer is not None and layer not in p.copper_layers:
+                continue
+            fp_pts.setdefault(p.ref, []).append(p.center)
+        for ref in sorted(fp_pts):
+            if not ref or ref == "?" or ref in silk_rendered_refs:
+                continue
+            cx = sum(pt[0] for pt in fp_pts[ref]) / len(fp_pts[ref])
+            cy = sum(pt[1] for pt in fp_pts[ref]) / len(fp_pts[ref])
+            if not (x_frame_left <= cx <= x_frame_right and y_frame_top <= cy <= y_frame_bottom):
+                continue  # footprint outside the rendered frame: nothing to label
+            if renderer is None:
+                renderer = ax.figure.canvas.get_renderer()
+            gap = fontsize_mm * _LABEL_GAP_FRACTION
+            # Try above / below / left / right of the centroid: pad labels
+            # already claim one side of the footprint, so a fixed anchor
+            # would collide with them and read as a skip.
+            fp_h = fontsize_mm * _FP_REF_SCALE
+            drawn = False
+            for dx, dy, ha, va in (
+                (0.0, -offset_mm, "center", "bottom"),  # above the centroid
+                (0.0, offset_mm, "center", "top"),  # below
+                (-offset_mm, 0.0, "right", "center"),  # left
+                (offset_mm, 0.0, "left", "center"),  # right
+            ):
+                artist = ax.text(
+                    cx + dx,
+                    cy + dy,
+                    ref,
+                    ha=ha,
+                    va=va,
+                    fontsize=fp_h * _PT_PER_MM,
+                    color=_FP_REF_COLOR,
+                    alpha=_FP_REF_ALPHA,
+                    zorder=_Z_PAD_LABEL,
+                    path_effects=[
+                        mpatheffects.withStroke(linewidth=0.3, foreground=_FP_REF_STROKE)
+                    ],
+                )
+                box = _label_data_bbox(ax, artist, renderer)
+                in_frame = (
+                    x_frame_left <= box[0]
+                    and box[2] <= x_frame_right
+                    and y_frame_top <= box[1]
+                    and box[3] <= y_frame_bottom
+                )
+                if in_frame and not any(_bbox_overlaps(box, placed, gap) for placed in label_boxes):
+                    label_boxes.append(box)
+                    fp_refs_drawn += 1
+                    drawn = True
+                    break
+                artist.remove()
+            if not drawn:
+                fp_refs_skipped.append(ref)
+    else:
+        fp_refs_drawn = 0
+        fp_refs_skipped: list[str] = []
+
+    return pad_labels_drawn, label_collisions, label_skipped, fp_refs_drawn, fp_refs_skipped
+
+
+def _validate_region(region: list[float] | None) -> tuple[float, float, float, float] | None:
+    """Validate a board-coordinate ``region`` box (mm, +Y down).
+
+    Returns the validated ``(x_min, y_min, x_max, y_max)`` or None when no
+    region is requested.  Raises ValueError on malformed input so a bad
+    zoom never silently renders the wrong area.
+    """
+    if region is None:
+        return None
+    if len(region) != 4:
+        raise ValueError(f"region must be [x_min, y_min, x_max, y_max], got {region!r}")
+    x_min, y_min, x_max, y_max = region
+    if x_min >= x_max or y_min >= y_max:
+        raise ValueError(f"region must satisfy x_min<x_max and y_min<y_max, got {region!r}")
+    return (x_min, y_min, x_max, y_max)
+
+
+def render_board(
+    pcb_path: str,
+    connect_pads: list[str] | None = None,
+    dpi: int | None = None,
+    layer: str | None = None,
+    show_pad_labels: bool = True,
+    label_scale: float = 1.0,
+    region: list[float] | None = None,
+    include_pad_coords: bool = False,
+    label_format: str = "number",
+    show_footprint_refs: bool = True,
+) -> tuple[list[str], bytes, dict[str, Any]]:
+    """Render a board to (report_lines, png_bytes, report_dict).
+
+    ``layer``: optional copper layer name (e.g. ``"F.Cu"``) to render a
+    single-layer image.  Only that layer's zones/pads/tracks are drawn;
+    vias, board edge, courtyards and silkscreen stay as reference.
+
+    ``dpi`` scales the PNG resolution directly (line widths and font sizes
+    are in mm units, so a higher dpi gives a sharper image of the same
+    layout).  Defaults to 200.
+
+    ``show_pad_labels``: draw a pad label beside every pad (default on —
+    needed for visual-model workflows that name pads; pass False for a
+    clean image).  A label that would collide with an already-placed one
+    is skipped; the skipped count and refs are reported as
+    ``label_collisions`` / ``label_skipped``.
+
+    ``label_format``: pad label text — ``"number"`` (default) draws just
+    the pad number (``"10"``); ``"ref.number"`` draws ``REF.PAD``
+    (``"U11.10"``) like the pre-#152 renderer.
+
+    ``label_scale``: scale the pad-label glyph size and offset (1.0 = the
+    default 0.4 mm glyphs); pass < 1.0 to fit smaller labels on dense
+    boards.  The collision gap scales with it.
+
+    ``region``: optional board-coordinate box ``[x_min, y_min, x_max,
+    y_max]`` in mm (KiCad +Y down) to zoom into.  The rendered frame
+    becomes exactly this box — returned as ``region_bbox`` so a caller can
+    map the crop back into full-board space — and the dpi floor is raised
+    so a region still renders >= 1600 px wide (full-board sharpness).
+
+    ``include_pad_coords``: also report machine-usable pad coordinates
+    ``pads_coords`` (ref, number, net, center [x, y] mm, layer) so a
+    caller can verify "what I see == what the tools will operate on".
+    Pads outside the rendered frame (``region``) or the rendered layer are
+    excluded, and ``layer`` is the copper layer the pad is shown on in
+    this image (the render layer in single-layer views, else the pad's
+    topmost copper layer).
+
+    ``show_footprint_refs``: draw one reference label per footprint (e.g.
+    ``U11``, silk-gray and larger than pad labels) above the footprint —
+    but only when its silkscreen reference text is not already rendered in
+    this view, so full-board renders never double-print a reference.
+    Overlapping refs are skipped; skipped refs are reported as
+    ``footprint_refs_skipped``.
+
+    connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
+    to draw ratsnest lines for — green, only for nets that are not yet routed.
+    """
+    if dpi is None:
+        dpi = 200
+    board = parse_board(pcb_path)
+
+    # Resolve requested pads to nets (name-based in KiCad 10).
+    requested: dict[str, list[tuple[tuple[float, float], tuple[str, ...]]]] = {}
+    missing: list[str] = []
+    for spec in connect_pads or []:
+        ref, _, num = spec.partition(".")
+        found = None
+        for p in board.pads:
+            if p.ref == ref and p.number == num:
+                found = p
+                break
+        if found is None:
+            missing.append(spec)
+            continue
+        if found.net:
+            requested.setdefault(found.net, []).append((found.center, tuple(found.copper_layers)))
+
+    # Each ratsnest edge carries the copper layers shared by its endpoint
+    # pads (a route could exist there), so a single-layer render can draw it
+    # on the layer where both pads live.
+    ratsnest: list[tuple[tuple[float, float], tuple[float, float], set[str]]] = []
+    pending_nets: list[str] = []
+    routed_reported: list[str] = []
+    for net, pts in sorted(requested.items()):
+        if len(pts) < 2:
+            continue
+        if net in board.routed_nets:
+            routed_reported.append(net)
+            continue
+        pending_nets.append(net)
+        centers = [p[0] for p in pts]
+        layers = [p[1] for p in pts]
+        for j, i in _mst(centers):
+            # Layers both endpoint pads share (a route could exist there);
+            # fall back to the union when the pads have no common layer.
+            shared = set(layers[j]) & set(layers[i])
+            ratsnest.append((centers[j], centers[i], shared or (set(layers[j]) | set(layers[i]))))
+
+    # --- figure ---
+    # region overrides the auto-computed bounds; the effective rendered box
+    # is echoed back as ``region_bbox`` (== full board when no region given).
+    region_bbox = _validate_region(region)
+    if region_bbox is None:
+        region_bbox = _bounds(board, ratsnest)
+    xmin, ymin, xmax, ymax = region_bbox
+    fig, ax, eff_dpi, mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    (
+        pad_labels,
+        label_collisions,
+        label_skipped,
+        fp_refs_drawn,
+        fp_refs_skipped,
+    ) = _draw_board_layers(
+        ax,
+        board,
+        layer=layer,
+        show_pad_labels=show_pad_labels,
+        label_scale=label_scale,
+        label_format=label_format,
+        show_footprint_refs=show_footprint_refs,
+    )
+
     # 7. Ratsnest on top; in a single-layer render only edges touching that
     # layer (source or target pad) are drawn.  Hairline white dashes, like
     # KiCad: manual segments keep both ends on the pads, and the width/dash
     # lengths are pixel-scaled so they look the same at any dpi.
     import matplotlib.collections as mcollections
 
-    px = 72.0 / dpi
+    px = mm_per_px * 72.0 / 25.4
     rat_segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for item in ratsnest:
         a, b, rlayers = item
@@ -1196,21 +1723,59 @@ def render_board(
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=dpi)
+    fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
     plt.close(fig)
 
     report: dict[str, Any] = {
         "pads": len(board.pads),
+        "pad_labels": pad_labels,
+        "label_collisions": label_collisions,
+        "label_skipped": label_skipped,
+        "footprint_refs": fp_refs_drawn,
+        "footprint_refs_skipped": fp_refs_skipped,
+        "region_bbox": list(region_bbox),
         "copper_layers": board.copper_layers,
         "connect_pads_requested": len(connect_pads or []),
         "missing_pads": missing,
         "pending_nets": pending_nets,
         "routed_nets": routed_reported,
     }
+    if include_pad_coords:
+        # Board-mm pad centers (KiCad +Y down) restricted to what the image
+        # actually shows: pads outside the rendered frame (region_bbox) or
+        # outside the rendered ``layer`` are excluded, and ``layer`` names
+        # the copper layer the pad is shown on in this image (the render
+        # layer in single-layer views, else the pad's topmost copper layer).
+        pads_coords: list[dict[str, Any]] = []
+        rx_min, ry_min, rx_max, ry_max = region_bbox
+        for p in board.pads:
+            if layer is not None and layer not in p.copper_layers:
+                continue
+            if not (rx_min <= p.center[0] <= rx_max and ry_min <= p.center[1] <= ry_max):
+                continue
+            pads_coords.append(
+                {
+                    "ref": p.ref,
+                    "number": p.number,
+                    "net": p.net,
+                    "center": [p.center[0], p.center[1]],
+                    "layer": layer
+                    if layer is not None
+                    else (p.copper_layers[0] if p.copper_layers else None),
+                }
+            )
+        report["pads_coords"] = pads_coords
     lines = [
         f"Rendered {os.path.basename(pcb_path)}: {len(board.pads)} pads, "
         f"{len(board.tracks)} tracks; copper layers: {', '.join(board.copper_layers)}."
     ]
+    if label_collisions:
+        lines.append(
+            f"pad labels: skipped {label_collisions} overlapping label(s) "
+            f"({', '.join(label_skipped)})."
+        )
+    if fp_refs_skipped:
+        lines.append(f"footprint refs: skipped {', '.join(fp_refs_skipped)} (overlapping).")
     if connect_pads:
         lines.append(
             f"connect_pads: missing={missing or 'none'}; "
@@ -1229,20 +1794,42 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         connect_pads: list[str] | None = None,
         output_dir: str | None = None,
         layer: str | None = None,
+        show_pad_labels: bool = True,
+        label_scale: float = 1.0,
+        region: list[float] | None = None,
+        include_pad_coords: bool = False,
+        label_format: str = "number",
+        show_footprint_refs: bool = True,
         ctx: Context | None = None,
     ) -> tuple[str, Image]:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
 
         By default the composite shows all copper layers stacked in physical
         order (F.Cu red on top, B.Cu blue below), courtyards, the board edge
-        and reference silkscreen on a dark KiCad-style background.  Pass
-        ``layer`` (e.g. ``"F.Cu"``, ``"In1.Cu"``, ``"B.Cu"``) to render a
-        single layer: only that layer's zones/pads/tracks are drawn, with
+        and reference silkscreen on a dark KiCad-style background.  Each pad
+        also gets a short ``PAD`` label (e.g. ``10``) so a visual model can
+        name the pads it wants to route — pass ``show_pad_labels=False`` for
+        a clean image, or ``label_format="ref.number"`` for ``REF.PAD``
+        labels.  In dense areas overlapping labels are skipped and
+        reported (``label_collisions`` / ``label_skipped``) instead of
+        smearing into an unreadable band.
+
+        Pass ``layer`` (e.g. ``"F.Cu"``, ``"In1.Cu"``, ``"B.Cu"``) to render
+        a single layer: only that layer's zones/pads/tracks are drawn, with
         vias, board edge and courtyards/silkscreen of that side kept as
         reference.  When ``connect_pads`` is provided (e.g. ``["J1.2",
         "J2.2"]``) the *unrouted* nets joining those pads are drawn as green
         ratsnest lines so the model can see exactly which pads still need to
         be connected.
+
+        ``region`` zooms the image to a board-coordinate box ``[x_min,
+        y_min, x_max, y_max]`` in mm (KiCad +Y down) at full-board
+        sharpness — use it to read a dense pad row or inspect short traces.
+        ``include_pad_coords=True`` returns machine-usable pad coordinates
+        (``pads_coords``) in board mm so the model can act on exactly what
+        it sees.  ``show_footprint_refs`` draws one reference label per
+        footprint (e.g. ``U11``) when its silkscreen reference is not
+        already visible in the view.
 
         Args:
             pcb_path: Path to the .kicad_pcb file.
@@ -1251,12 +1838,37 @@ def register_render_board_tools(mcp: FastMCP) -> None:
                 are drawn as green ratsnest.
             output_dir: Optional directory to write the PNG to.
             layer: Optional copper layer name for a single-layer render.
+            show_pad_labels: Draw a pad label beside every pad (default
+                True; overlapping labels in dense areas are skipped and
+                counted in the report).
+            label_scale: Scale factor for pad-label glyph size and offset
+                (default 1.0 = 0.4 mm glyphs); use < 1.0 on dense boards.
+            region: Optional zoom box [x_min, y_min, x_max, y_max] in board
+                mm (KiCad +Y down); rendered frame equals this box.
+            include_pad_coords: Include ``pads_coords`` (ref, number, net,
+                center, layer) in the report (default False).  Only pads
+                inside the rendered frame/layer are listed.
+            label_format: Pad label text — ``"number"`` (default) or
+                ``"ref.number"``.
+            show_footprint_refs: Draw one reference label per footprint
+                when its silkscreen reference text is not already visible
+                (default True).
             ctx: FastMCP context for progress reporting.
 
         Returns:
             A text report plus the PNG image.
         """
-        lines, png, report = render_board(pcb_path, connect_pads=connect_pads, layer=layer)
+        lines, png, report = render_board(
+            pcb_path,
+            connect_pads=connect_pads,
+            layer=layer,
+            show_pad_labels=show_pad_labels,
+            label_scale=label_scale,
+            region=region,
+            include_pad_coords=include_pad_coords,
+            label_format=label_format,
+            show_footprint_refs=show_footprint_refs,
+        )
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             base = os.path.splitext(os.path.basename(pcb_path))[0]
