@@ -16,6 +16,7 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
+from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
 
@@ -75,6 +76,7 @@ def _make_client(
     settings = types.SimpleNamespace(
         llm_provider="openai",
         llm_api_key="sk-test",
+        llm_user_agent=DEFAULT_LLM_USER_AGENT,
         llm_model="gpt-4o",
         llm_base_url="",
         llm_context_tokens=context_tokens,
@@ -904,6 +906,58 @@ class TestMaybeCompact:
             client._maybe_compact("system")
         assert call_order == ["compact", "annotate"]
 
+    def test_budget_parameters_stay_integer(self):
+        """context_tokens * float threshold must not leak a float into the
+        compaction budget: `summary[:target_summary_chars]` with a float
+        slice crashes with "slice indices must be integers" (regression:
+        the pre-fix target_post_compact was float, and the min() against
+        the int window cap sometimes picked the float side)."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 400  # ~100 tokens each
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        with patch.object(client, "_compact_history", return_value=True) as mock_compact:
+            client._maybe_compact("system")
+        called_args = mock_compact.call_args.args
+        assert isinstance(called_args[2], int), called_args[2]
+
+    def test_compaction_real_path_never_float_slices(self):
+        """The full _maybe_compact -> _compact_history path survives a
+        history that overflows the budget: the live LLM call we patch is
+        the compaction summariser, so the real _compact_history code runs
+        (float-free slices) instead of a mocked return."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 4000  # far over the 70-token threshold
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        # Compaction's own LLM call must succeed (short fake response).
+        with patch.object(client, "_call_openai") as mock_openai:
+            mock_openai.return_value = {"message": {"content": "summarised context"}}
+            # Tools estimation walks the registry; a bare client is fine —
+            # registry is None so zero tools.
+            err = client._maybe_compact("system")
+        assert err is None or err.startswith("[Error]")
+        # History collapsed to summary + preserved recent turns (compaction
+        # actually ran, reached the slice site).
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+
 
 # ---------------------------------------------------------------------------
 # run() integration
@@ -1566,13 +1620,17 @@ class TestOpenAICompatibleRequests:
         assert client._openai_headers() == {
             "Content-Type": "application/json",
             "Authorization": "Bearer sk-test",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_authorization(self):
         client = _make_client()
         client._settings.llm_api_key = ""
 
-        assert client._openai_headers() == {"Content-Type": "application/json"}
+        assert client._openai_headers() == {
+            "Content-Type": "application/json",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
+        }
 
     def test_api_key_adds_x_api_key(self):
         client = _make_client()
@@ -1581,6 +1639,7 @@ class TestOpenAICompatibleRequests:
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
             "x-api-key": "sk-test",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_x_api_key(self):
@@ -1590,7 +1649,67 @@ class TestOpenAICompatibleRequests:
         assert client._anthropic_headers() == {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            "User-Agent": DEFAULT_LLM_USER_AGENT,
         }
+
+    def test_default_user_agent_is_proven_python_requests(self):
+        """The default UA must be a proven value, not a plugin-branded one."""
+        client = _make_client()
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "python-requests/2.32.3"
+            assert not headers["User-Agent"].startswith("KiCad-AI-Assistant")
+
+    def test_default_user_agent_with_empty_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "python-requests/2.32.3"
+            assert not headers["User-Agent"].startswith("KiCad-AI-Assistant")
+
+    def test_user_agent_never_starts_with_python_urllib(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert not headers["User-Agent"].startswith("Python-urllib")
+
+    def test_both_builders_send_identical_user_agent(self):
+        client = _make_client()
+
+        openai_ua = client._openai_headers()["User-Agent"]
+        anthropic_ua = client._anthropic_headers()["User-Agent"]
+        assert openai_ua == anthropic_ua
+        assert anthropic_ua == DEFAULT_LLM_USER_AGENT
+
+    def test_custom_user_agent_used_by_openai_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        assert client._openai_headers()["User-Agent"] == "axios/1.7.0"
+
+    def test_custom_user_agent_used_by_anthropic_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        assert client._anthropic_headers()["User-Agent"] == "axios/1.7.0"
+
+    def test_custom_user_agent_not_confused_with_urllib_default(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "axios/1.7.0"
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "axios/1.7.0"
+            assert "Python-urllib" not in headers["User-Agent"]
+
+    def test_empty_user_agent_falls_back_to_plugin_constant(self):
+        """Empty setting (legacy in-memory objects) keeps the plugin constant
+        as a safety fallback; the proven default covers real configs."""
+        client = _make_client()
+        client._settings.llm_user_agent = ""
+
+        assert client._user_agent() == llm_client._LLM_USER_AGENT
 
 
 # ---------------------------------------------------------------------------
